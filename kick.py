@@ -1,33 +1,22 @@
-"""
-$description Kick, a gaming livestreaming platform
-$url kick.com
-$type live, vod
-"""
-
 import re
-import cloudscraper
 import logging
-
+import webview
+import json
 from streamlink.plugin import Plugin, pluginmatcher
 from streamlink.plugin.api import validate
 from streamlink.stream import HLSStream
-from streamlink.utils.parse import parse_json
 from streamlink.exceptions import PluginError
-
 
 log = logging.getLogger(__name__)
 
-
 @pluginmatcher(
     re.compile(
-        # https://github.com/yt-dlp/yt-dlp/blob/9b7a48abd1b187eae1e3f6c9839c47d43ccec00b/yt_dlp/extractor/kick.py#LL33-L33C111
         r"https?://(?:www\.)?kick\.com/(?!(?:video|categories|search|auth)(?:[/?#]|$))(?P<channel>[\w_-]+)$",
     ),
     name="live",
 )
 @pluginmatcher(
     re.compile(
-        # https://github.com/yt-dlp/yt-dlp/blob/2d5cae9636714ff922d28c548c349d5f2b48f317/yt_dlp/extractor/kick.py#LL84C18-L84C104
         r"https?://(?:www\.)?kick\.com/video/(?P<video_id>[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12})",
     ),
     name="vod",
@@ -109,40 +98,58 @@ class KICK(Plugin):
             self.matches["clip"],
         )
 
-        try:
-            scraper = cloudscraper.create_scraper()
-            res = scraper.get(
-                "{0}/{1}/{2}".format(
-                    API_BASE_URL,
-                    *(
-                        ["v1/channels", self.match["channel"]]
-                        if live
-                        else (
-                            ["v1/video", self.match["video_id"]]
-                            if vod
-                            else ["v2/clips", self.match["clip_id"]]
-                        )
-                    )
+        api_url = "{0}/{1}/{2}".format(
+            API_BASE_URL,
+            *(
+                ["v1/channels", self.match["channel"]]
+                if live
+                else (
+                    ["v1/video", self.match["video_id"]]
+                    if vod
+                    else ["v2/clips", self.match["clip_id"]]
                 )
             )
+        )
 
+        class ApiHandler:
+            def __init__(self):
+                self.page_content = None
+                self.win = None
+
+            def set_win(self, window):
+                self.win = window
+                
+
+            def get_content(self):
+                try:
+                    self.page_content = self.win.evaluate_js("document.body.innerText")
+                    json.loads(self.page_content)
+                except Exception as e:
+                    return False
+
+                self.win.destroy()    
+                
+        handler = ApiHandler()
+
+        window = webview.create_window('Kick API Request', api_url, width=800, height=600)
+        window.events.loaded += handler.get_content
+
+        webview.start(handler.set_win, window, gui='edgechromium')  # Log the beginning of the content
+
+        try:
             url, self.id, self.author, self.title, self.category = (
                 _LIVE_SCHEMA if live else (_VIDEO_SCHEMA if vod else _CLIP_SCHEMA)
-            ).validate(res.text)
-
+            ).validate(handler.page_content)
         except (PluginError, TypeError) as err:
             log.debug(err)
             return
-        
-        finally:
-            scraper.close()
 
+   
         if live or vod:
             yield from HLSStream.parse_variant_playlist(self.session, url).items()
         elif (
             clip and self.author.casefold() == self.match["channel"].casefold()
         ):  # Sanity check if the clip channel is the same as the one in the URL
             yield "source", HLSStream(self.session, url)
-
 
 __plugin__ = KICK
